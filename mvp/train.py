@@ -196,8 +196,8 @@ def train_phase1(
             f"time={elapsed:.1f}s"
         )
 
-        # Save checkpoint
-        save_path = checkpoint_dir / f"epoch_{epoch+1}.pt"
+        # Save checkpoint (only keep latest to save disk)
+        save_path = checkpoint_dir / "latest.pt"
         torch.save(
             {
                 "epoch": epoch + 1,
