@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -77,6 +78,7 @@ def train_phase2(
     eval_gate=0.2,
     test_data=None,
     contrastive_weight=0.1,
+    n_distractors=4,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -123,14 +125,29 @@ def train_phase2(
                 ex = formatted[idx]
                 fact_text = dataset[idx]["fact"]
 
+                # Encode target fact with gradients
                 key, value = encode_fact_with_grad(surgical_model, fact_text, device)
                 batch_keys.append(key)
 
+                # Build memory bank with target + distractors
                 bank = MemoryBank(
                     memory_dim=surgical_model.memory_block.memory_dim,
                     max_entries=256,
                 )
                 bank.write(key, value, detach=False)
+
+                # Add distractor facts — forces selective retrieval
+                if n_distractors > 0:
+                    d_indices = random.sample(
+                        [i for i in range(len(dataset)) if i != idx],
+                        min(n_distractors, len(dataset) - 1),
+                    )
+                    for d_idx in d_indices:
+                        d_key, d_value = encode_fact_with_grad(
+                            surgical_model, dataset[d_idx]["fact"], device
+                        )
+                        bank.write(d_key, d_value, detach=False)
+
                 surgical_model.set_memory_bank(bank)
 
                 input_ids = ex["input_ids"].unsqueeze(0).to(device)
@@ -243,8 +260,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v2")
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v3")
     parser.add_argument("--contrastive_weight", type=float, default=0.1)
+    parser.add_argument("--n_distractors", type=int, default=4)
     parser.add_argument("--phase1_checkpoint", default="checkpoints/qwen7b_v2/best.pt")
     parser.add_argument("--gate_max", type=float, default=0.25)
     parser.add_argument("--eval_gate", type=float, default=0.2)
@@ -287,6 +305,7 @@ def main():
         eval_gate=args.eval_gate,
         test_data=test_data,
         contrastive_weight=args.contrastive_weight,
+        n_distractors=args.n_distractors,
     )
 
     # Final evaluation
