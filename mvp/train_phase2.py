@@ -74,6 +74,7 @@ def train_phase2(
     dataset,
     epochs=30,
     lr=1e-4,
+    read_lr_ratio=0.1,
     batch_size=4,
     device="cuda",
     checkpoint_dir="checkpoints",
@@ -88,30 +89,42 @@ def train_phase2(
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Freeze read pathway (it works from Phase 1), train only write pathway
+    # All params trainable, but asymmetric LR: read adapts slowly, write learns fast
     for param in surgical_model.memory_block.parameters():
-        param.requires_grad = False
-    for param in surgical_model.memory_block.write_key_proj.parameters():
-        param.requires_grad = True
-    for param in surgical_model.memory_block.write_value_proj.parameters():
-        param.requires_grad = True
-    for param in surgical_model.memory_block.importance_gate.parameters():
-        param.requires_grad = True
-    for param in surgical_model.memory_block.recon_proj.parameters():
         param.requires_grad = True
 
-    trainable_params = [p for p in surgical_model.memory_block.parameters() if p.requires_grad]
-    total_params = sum(p.numel() for p in trainable_params)
-    print(f"\nPhase 2: Training {total_params:,} write pathway params (read pathway FROZEN)")
-    print(f"  Write: write_key_proj, write_value_proj, importance_gate, recon_proj")
+    mb = surgical_model.memory_block
+    write_params = (
+        list(mb.write_key_proj.parameters())
+        + list(mb.write_value_proj.parameters())
+        + list(mb.importance_gate.parameters())
+        + list(mb.recon_proj.parameters())
+    )
+    read_params = (
+        list(mb.read_query_proj.parameters())
+        + list(mb.read_attn.parameters())
+        + list(mb.read_output_proj.parameters())
+        + list(mb.layer_norm.parameters())
+        + [mb.gate]
+    )
+
+    write_count = sum(p.numel() for p in write_params)
+    read_count = sum(p.numel() for p in read_params)
+    read_lr = lr * read_lr_ratio
+    print(f"\nPhase 2: Asymmetric LR training")
+    print(f"  Write pathway ({write_count:,} params): lr={lr}")
+    print(f"  Read pathway ({read_count:,} params): lr={read_lr}")
     print(f"  Gate clamped to max {gate_max}.")
     print(f"  Distractors: {n_distractors}, Contrastive: {contrastive_weight}")
     print(f"  Reconstruction weight: {recon_weight}")
     print(f"  Fresh data per epoch: {fresh_data}\n")
 
+    trainable_params = write_params + read_params
     optimizer = AdamW(
-        trainable_params,
-        lr=lr,
+        [
+            {"params": write_params, "lr": lr},
+            {"params": read_params, "lr": read_lr},
+        ],
         weight_decay=0.01,
     )
 
@@ -216,7 +229,8 @@ def train_phase2(
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-            # Gate is frozen (read pathway), no need to clamp
+            with torch.no_grad():
+                surgical_model.memory_block.gate.clamp_(max=gate_max)
 
             epoch_loss += batch_lm_total
 
@@ -293,12 +307,13 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v6")
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v7")
     parser.add_argument("--contrastive_weight", type=float, default=0.5)
     parser.add_argument("--recon_weight", type=float, default=0.1)
     parser.add_argument("--n_distractors", type=int, default=0)
     parser.add_argument("--fresh_data", action="store_true", default=True)
     parser.add_argument("--phase1_checkpoint", default="checkpoints/qwen7b_v2/best.pt")
+    parser.add_argument("--read_lr_ratio", type=float, default=0.1)
     parser.add_argument("--gate_max", type=float, default=0.25)
     parser.add_argument("--eval_gate", type=float, default=0.2)
     args = parser.parse_args()
@@ -333,6 +348,7 @@ def main():
         dataset=train_data,
         epochs=args.epochs,
         lr=args.lr,
+        read_lr_ratio=args.read_lr_ratio,
         batch_size=args.batch_size,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
