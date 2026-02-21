@@ -1,11 +1,12 @@
 """
-Phase 2: Joint Read+Write Training for Memory Graft.
+Phase 2: Write Pathway Training for Memory Graft.
 
 Key difference from Phase 1:
-- Write pathway is UNFROZEN — model learns WHAT to store
+- Read pathway is FROZEN (preserved from Phase 1 where it achieved +8% delta)
+- Only write pathway trains: write_key_proj, write_value_proj, importance_gate, recon_proj
 - Facts are re-encoded each forward pass with gradients on write projections
-- Gradients flow: loss -> read pathway -> cross-attention -> stored keys/values -> write pathway
-- Gate clamped to prevent runaway (sweet spot: ~0.2 from Phase 1 experiments)
+- Reconstruction loss gives write_value_proj a direct gradient signal
+- Contrastive loss pushes different fact keys apart
 
 Usage:
     python -m mvp.train_phase2 --phase1_checkpoint checkpoints/qwen7b_v2/best.pt
@@ -87,19 +88,29 @@ def train_phase2(
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Unfreeze ALL memory block params
+    # Freeze read pathway (it works from Phase 1), train only write pathway
     for param in surgical_model.memory_block.parameters():
+        param.requires_grad = False
+    for param in surgical_model.memory_block.write_key_proj.parameters():
+        param.requires_grad = True
+    for param in surgical_model.memory_block.write_value_proj.parameters():
+        param.requires_grad = True
+    for param in surgical_model.memory_block.importance_gate.parameters():
+        param.requires_grad = True
+    for param in surgical_model.memory_block.recon_proj.parameters():
         param.requires_grad = True
 
-    total_params = sum(p.numel() for p in surgical_model.memory_block.parameters())
-    print(f"\nPhase 2: Training ALL {total_params:,} memory block params")
-    print(f"  Read + Write pathways. Gate clamped to max {gate_max}.")
+    trainable_params = [p for p in surgical_model.memory_block.parameters() if p.requires_grad]
+    total_params = sum(p.numel() for p in trainable_params)
+    print(f"\nPhase 2: Training {total_params:,} write pathway params (read pathway FROZEN)")
+    print(f"  Write: write_key_proj, write_value_proj, importance_gate, recon_proj")
+    print(f"  Gate clamped to max {gate_max}.")
     print(f"  Distractors: {n_distractors}, Contrastive: {contrastive_weight}")
     print(f"  Reconstruction weight: {recon_weight}")
     print(f"  Fresh data per epoch: {fresh_data}\n")
 
     optimizer = AdamW(
-        surgical_model.memory_block.parameters(),
+        trainable_params,
         lr=lr,
         weight_decay=0.01,
     )
@@ -202,13 +213,10 @@ def train_phase2(
 
             accumulated_loss.backward()
 
-            torch.nn.utils.clip_grad_norm_(
-                surgical_model.memory_block.parameters(), max_norm=1.0
-            )
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
 
-            with torch.no_grad():
-                surgical_model.memory_block.gate.clamp_(max=gate_max)
+            # Gate is frozen (read pathway), no need to clamp
 
             epoch_loss += batch_lm_total
 
@@ -285,7 +293,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v5")
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v6")
     parser.add_argument("--contrastive_weight", type=float, default=0.5)
     parser.add_argument("--recon_weight", type=float, default=0.1)
     parser.add_argument("--n_distractors", type=int, default=0)
