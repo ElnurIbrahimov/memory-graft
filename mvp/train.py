@@ -165,13 +165,12 @@ def train_phase1(
 
                 # Check accuracy: does the model predict the right answer tokens?
                 with torch.no_grad():
-                    preds = outputs.logits.argmax(dim=-1)
-                    mask = labels != -100
+                    preds = outputs.logits[:, :-1, :].argmax(dim=-1)
+                    target = labels[:, 1:]
+                    mask = target != -100
                     if mask.any():
-                        correct = (preds[mask[..., :-1]] == labels[..., 1:][mask[..., 1:]]).sum().item() if mask[..., 1:].any() else 0
-                        total = mask[..., 1:].sum().item() if mask[..., 1:].any() else 0
-                        epoch_correct += correct
-                        epoch_total += total
+                        epoch_correct += (preds[mask] == target[mask]).sum().item()
+                        epoch_total += mask.sum().item()
 
                 loss.backward()
 
