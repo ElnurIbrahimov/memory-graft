@@ -68,14 +68,16 @@ class SurgicalModel:
             and self.memory_bank.has_entries()
         ):
             # Ensure 3D for memory block
+            orig_dtype = hidden_states.dtype
             needs_squeeze = False
             if hidden_states.dim() == 2:
                 hidden_states = hidden_states.unsqueeze(0)
                 needs_squeeze = True
 
+            # Cast to float32 for memory block, then back
             modified = self.memory_block.read(
-                hidden_states, self.memory_bank, device=self.device
-            )
+                hidden_states.float(), self.memory_bank, device=self.device
+            ).to(orig_dtype)
 
             if needs_squeeze:
                 modified = modified.squeeze(0)
@@ -125,7 +127,7 @@ class SurgicalModel:
             h = h.unsqueeze(0)
 
         with torch.no_grad():
-            keys, values = self.memory_block.encode_to_memory(h)
+            keys, values = self.memory_block.encode_to_memory(h.float())
             memory_bank.write(keys.squeeze(0), values.squeeze(0))
 
     def __call__(self, **kwargs):
@@ -184,12 +186,12 @@ class SurgicalModel:
                 f"layer_idx={layer_idx} but model only has {n_layers} layers"
             )
 
-        # Create memory block (trainable, same dtype as base model)
+        # Create memory block (trainable, float32 for stable training)
         memory_block = MemoryBlock(
             d_model=d_model,
             memory_dim=memory_dim,
             n_heads=n_heads,
-        ).to(device=device, dtype=dtype)
+        ).to(device).float()
 
         print(f"Memory block: {memory_block.param_count_str()} trainable parameters")
         print(f"Spliced at layer {layer_idx}/{n_layers}")
