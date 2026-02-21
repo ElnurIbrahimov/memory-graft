@@ -34,12 +34,13 @@ class MemoryBank:
         self.timestamps = []
         self.access_counts = []
 
-    def write(self, keys, values, importance_scores=None):
+    def write(self, keys, values, importance_scores=None, detach=True):
         """
         Add memories.
         keys: [n, memory_dim] or [memory_dim]
         values: [n, memory_dim] or [memory_dim]
         importance_scores: [n] or scalar or None
+        detach: if False, keep gradients (for Phase 2 training)
         """
         if keys.dim() == 1:
             keys = keys.unsqueeze(0)
@@ -56,8 +57,12 @@ class MemoryBank:
 
         now = time.time()
         for i in range(n):
-            self.keys.append(keys[i].detach().cpu())
-            self.values.append(values[i].detach().cpu())
+            if detach:
+                self.keys.append(keys[i].detach().cpu())
+                self.values.append(values[i].detach().cpu())
+            else:
+                self.keys.append(keys[i])
+                self.values.append(values[i])
             self.importance.append(importance_scores[i])
             self.timestamps.append(now)
             self.access_counts.append(0)
