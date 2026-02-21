@@ -78,7 +78,8 @@ def train_phase2(
     eval_gate=0.2,
     test_data=None,
     contrastive_weight=0.1,
-    n_distractors=4,
+    n_distractors=0,
+    fresh_data=True,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -89,7 +90,9 @@ def train_phase2(
 
     total_params = sum(p.numel() for p in surgical_model.memory_block.parameters())
     print(f"\nPhase 2: Training ALL {total_params:,} memory block params")
-    print(f"  Read + Write pathways. Gate clamped to max {gate_max}.\n")
+    print(f"  Read + Write pathways. Gate clamped to max {gate_max}.")
+    print(f"  Distractors: {n_distractors}, Contrastive: {contrastive_weight}")
+    print(f"  Fresh data per epoch: {fresh_data}\n")
 
     optimizer = AdamW(
         surgical_model.memory_block.parameters(),
@@ -98,7 +101,8 @@ def train_phase2(
     )
 
     tokenizer = surgical_model.tokenizer
-    formatted = [format_for_training(ex, tokenizer) for ex in dataset]
+    base_formatted = [format_for_training(ex, tokenizer) for ex in dataset]
+    base_dataset = dataset
 
     surgical_model.memory_block.train()
     best_loss = float("inf")
@@ -109,6 +113,14 @@ def train_phase2(
         epoch_correct = 0
         epoch_total = 0
         t0 = time.time()
+
+        # Fresh data each epoch — model can't memorize fixed fact-answer pairs
+        if fresh_data:
+            dataset = generate_dataset(n=len(base_dataset), seed=42 + epoch)
+            formatted = [format_for_training(ex, tokenizer) for ex in dataset]
+        else:
+            dataset = base_dataset
+            formatted = base_formatted
 
         indices = torch.randperm(len(formatted)).tolist()
 
@@ -255,14 +267,15 @@ def main():
     parser.add_argument("--memory_dim", type=int, default=512)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v3")
-    parser.add_argument("--contrastive_weight", type=float, default=0.1)
-    parser.add_argument("--n_distractors", type=int, default=4)
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v4")
+    parser.add_argument("--contrastive_weight", type=float, default=0.5)
+    parser.add_argument("--n_distractors", type=int, default=0)
+    parser.add_argument("--fresh_data", action="store_true", default=True)
     parser.add_argument("--phase1_checkpoint", default="checkpoints/qwen7b_v2/best.pt")
     parser.add_argument("--gate_max", type=float, default=0.25)
     parser.add_argument("--eval_gate", type=float, default=0.2)
@@ -306,6 +319,7 @@ def main():
         test_data=test_data,
         contrastive_weight=args.contrastive_weight,
         n_distractors=args.n_distractors,
+        fresh_data=args.fresh_data,
     )
 
     # Final evaluation
