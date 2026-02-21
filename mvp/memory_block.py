@@ -100,17 +100,17 @@ class MemoryBlock(nn.Module):
     def encode_to_memory(self, hidden_state):
         """
         Project hidden states into memory space for storage.
-        Used during memory bank population (Phase 1: with no_grad).
 
         hidden_state: [batch, seq_len, d_model]
         Returns: keys [batch, memory_dim], values [batch, memory_dim]
-                 (mean-pooled across sequence length)
         """
-        # Mean pool across sequence
-        pooled = hidden_state.mean(dim=1)  # [batch, d_model]
+        # Last token captures full sentence context in autoregressive models.
+        # Mean-pool dilutes discriminative tokens ("Alice" in "The user's name is Alice")
+        # because shared prefix tokens dominate the average.
+        last_token = hidden_state[:, -1, :]  # [batch, d_model]
 
-        keys = self.write_key_proj(pooled)    # [batch, memory_dim]
-        values = self.write_value_proj(pooled) # [batch, memory_dim]
+        keys = self.write_key_proj(last_token)    # [batch, memory_dim]
+        values = self.write_value_proj(last_token) # [batch, memory_dim]
 
         return keys, values
 

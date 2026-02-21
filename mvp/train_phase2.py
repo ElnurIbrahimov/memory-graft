@@ -17,6 +17,7 @@ from pathlib import Path
 
 import torch
 from torch.optim import AdamW
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from .surgery import SurgicalModel
@@ -54,6 +55,16 @@ def encode_fact_with_grad(surgical_model, text, device):
     return keys.squeeze(0), values.squeeze(0)
 
 
+def contrastive_key_loss(keys):
+    """Push different fact encodings apart in memory space."""
+    if keys.size(0) < 2:
+        return torch.tensor(0.0, device=keys.device, requires_grad=True)
+    keys_norm = F.normalize(keys, dim=-1)
+    sim = keys_norm @ keys_norm.T
+    mask = ~torch.eye(sim.size(0), dtype=torch.bool, device=sim.device)
+    return sim[mask].mean()
+
+
 def train_phase2(
     surgical_model,
     dataset,
@@ -65,6 +76,7 @@ def train_phase2(
     gate_max=0.25,
     eval_gate=0.2,
     test_data=None,
+    contrastive_weight=0.1,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +103,7 @@ def train_phase2(
 
     for epoch in range(epochs):
         epoch_loss = 0.0
+        epoch_c_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
         t0 = time.time()
@@ -101,15 +114,18 @@ def train_phase2(
             batch_indices = indices[start : start + batch_size]
             optimizer.zero_grad()
 
-            batch_loss = 0.0
+            # Encode all facts and run forward passes, accumulating loss
+            batch_keys = []
+            accumulated_loss = None
+            batch_lm_total = 0.0
+
             for idx in batch_indices:
                 ex = formatted[idx]
                 fact_text = dataset[idx]["fact"]
 
-                # Encode fact WITH gradients on write pathway
                 key, value = encode_fact_with_grad(surgical_model, fact_text, device)
+                batch_keys.append(key)
 
-                # Build memory bank (no detach — gradients flow through!)
                 bank = MemoryBank(
                     memory_dim=surgical_model.memory_block.memory_dim,
                     max_entries=256,
@@ -117,15 +133,18 @@ def train_phase2(
                 bank.write(key, value, detach=False)
                 surgical_model.set_memory_bank(bank)
 
-                # Forward pass
                 input_ids = ex["input_ids"].unsqueeze(0).to(device)
                 labels = ex["labels"].unsqueeze(0).to(device)
 
                 outputs = surgical_model(input_ids=input_ids, labels=labels)
-                loss = outputs.loss / len(batch_indices)
-                batch_loss += loss.item() * len(batch_indices)
+                lm_loss = outputs.loss / len(batch_indices)
+                batch_lm_total += outputs.loss.item()
 
-                # Accuracy
+                if accumulated_loss is None:
+                    accumulated_loss = lm_loss
+                else:
+                    accumulated_loss = accumulated_loss + lm_loss
+
                 with torch.no_grad():
                     preds = outputs.logits[:, :-1, :].argmax(dim=-1)
                     target = labels[:, 1:]
@@ -134,27 +153,37 @@ def train_phase2(
                         epoch_correct += (preds[mask] == target[mask]).sum().item()
                         epoch_total += mask.sum().item()
 
-                loss.backward()
+            # Contrastive loss: push different fact keys apart
+            if contrastive_weight > 0 and len(batch_keys) > 1:
+                keys_tensor = torch.stack(batch_keys)
+                c_loss = contrastive_key_loss(keys_tensor)
+                accumulated_loss = accumulated_loss + contrastive_weight * c_loss
+                epoch_c_loss += c_loss.item()
+
+            accumulated_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
                 surgical_model.memory_block.parameters(), max_norm=1.0
             )
             optimizer.step()
 
-            # Clamp gate to prevent runaway
             with torch.no_grad():
                 surgical_model.memory_block.gate.clamp_(max=gate_max)
 
-            epoch_loss += batch_loss
+            epoch_loss += batch_lm_total
 
         avg_loss = epoch_loss / len(formatted)
         accuracy = epoch_correct / max(epoch_total, 1) * 100
         elapsed = time.time() - t0
         gate_val = surgical_model.memory_block.gate.item()
 
+        n_batches = (len(formatted) + batch_size - 1) // batch_size
+        avg_c_loss = epoch_c_loss / max(n_batches, 1)
+
         print(
             f"Epoch {epoch+1}/{epochs}  "
             f"loss={avg_loss:.4f}  "
+            f"c_loss={avg_c_loss:.4f}  "
             f"acc={accuracy:.1f}%  "
             f"gate={gate_val:.4f}  "
             f"time={elapsed:.1f}s"
@@ -214,7 +243,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2")
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v2")
+    parser.add_argument("--contrastive_weight", type=float, default=0.1)
     parser.add_argument("--phase1_checkpoint", default="checkpoints/qwen7b_v2/best.pt")
     parser.add_argument("--gate_max", type=float, default=0.25)
     parser.add_argument("--eval_gate", type=float, default=0.2)
@@ -256,6 +286,7 @@ def main():
         gate_max=args.gate_max,
         eval_gate=args.eval_gate,
         test_data=test_data,
+        contrastive_weight=args.contrastive_weight,
     )
 
     # Final evaluation
