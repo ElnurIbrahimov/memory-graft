@@ -44,6 +44,9 @@ class MemoryBlock(nn.Module):
             nn.Sigmoid(),
         )
 
+        # === RECONSTRUCTION (auxiliary training signal for write pathway) ===
+        self.recon_proj = nn.Linear(memory_dim, d_model)
+
         # === GATED RESIDUAL ===
         # Gate starts near zero — memory block contributes almost nothing at init.
         # Small non-zero value (0.01) so ALL params get gradient signal from step 1.

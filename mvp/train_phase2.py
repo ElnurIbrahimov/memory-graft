@@ -52,8 +52,10 @@ def encode_fact_with_grad(surgical_model, text, device):
         h = h.unsqueeze(0)
 
     # Write pathway WITH gradients (no torch.no_grad here!)
-    keys, values = surgical_model.memory_block.encode_to_memory(h.float())
-    return keys.squeeze(0), values.squeeze(0)
+    h_float = h.float()
+    keys, values = surgical_model.memory_block.encode_to_memory(h_float)
+    h_last = h_float[:, -1, :].detach()  # target for reconstruction loss
+    return keys.squeeze(0), values.squeeze(0), h_last.squeeze(0)
 
 
 def contrastive_key_loss(keys):
@@ -80,6 +82,7 @@ def train_phase2(
     contrastive_weight=0.1,
     n_distractors=0,
     fresh_data=True,
+    recon_weight=0.1,
 ):
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -92,6 +95,7 @@ def train_phase2(
     print(f"\nPhase 2: Training ALL {total_params:,} memory block params")
     print(f"  Read + Write pathways. Gate clamped to max {gate_max}.")
     print(f"  Distractors: {n_distractors}, Contrastive: {contrastive_weight}")
+    print(f"  Reconstruction weight: {recon_weight}")
     print(f"  Fresh data per epoch: {fresh_data}\n")
 
     optimizer = AdamW(
@@ -110,6 +114,7 @@ def train_phase2(
     for epoch in range(epochs):
         epoch_loss = 0.0
         epoch_c_loss = 0.0
+        epoch_r_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
         t0 = time.time()
@@ -138,7 +143,7 @@ def train_phase2(
                 fact_text = dataset[idx]["fact"]
 
                 # Encode target fact with gradients
-                key, value = encode_fact_with_grad(surgical_model, fact_text, device)
+                key, value, h_orig = encode_fact_with_grad(surgical_model, fact_text, device)
                 batch_keys.append(key)
 
                 # Build memory bank with target + distractors
@@ -155,7 +160,7 @@ def train_phase2(
                         min(n_distractors, len(dataset) - 1),
                     )
                     for d_idx in d_indices:
-                        d_key, d_value = encode_fact_with_grad(
+                        d_key, d_value, _ = encode_fact_with_grad(
                             surgical_model, dataset[d_idx]["fact"], device
                         )
                         bank.write(d_key, d_value, detach=False)
@@ -169,10 +174,16 @@ def train_phase2(
                 lm_loss = outputs.loss / len(batch_indices)
                 batch_lm_total += outputs.loss.item()
 
+                # Reconstruction loss — direct gradient to write_value_proj
+                h_recon = surgical_model.memory_block.recon_proj(value)
+                r_loss = recon_weight * F.mse_loss(h_recon, h_orig) / len(batch_indices)
+                epoch_r_loss += F.mse_loss(h_recon, h_orig).item()
+
+                step_loss = lm_loss + r_loss
                 if accumulated_loss is None:
-                    accumulated_loss = lm_loss
+                    accumulated_loss = step_loss
                 else:
-                    accumulated_loss = accumulated_loss + lm_loss
+                    accumulated_loss = accumulated_loss + step_loss
 
                 with torch.no_grad():
                     preds = outputs.logits[:, :-1, :].argmax(dim=-1)
@@ -208,10 +219,12 @@ def train_phase2(
 
         n_batches = (len(formatted) + batch_size - 1) // batch_size
         avg_c_loss = epoch_c_loss / max(n_batches, 1)
+        avg_r_loss = epoch_r_loss / len(formatted)
 
         print(
             f"Epoch {epoch+1}/{epochs}  "
             f"loss={avg_loss:.4f}  "
+            f"r_loss={avg_r_loss:.4f}  "
             f"c_loss={avg_c_loss:.4f}  "
             f"acc={accuracy:.1f}%  "
             f"gate={gate_val:.4f}  "
@@ -272,8 +285,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_train", type=int, default=500)
     parser.add_argument("--n_test", type=int, default=50)
-    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v4")
+    parser.add_argument("--checkpoint_dir", default="checkpoints/qwen7b_phase2_v5")
     parser.add_argument("--contrastive_weight", type=float, default=0.5)
+    parser.add_argument("--recon_weight", type=float, default=0.1)
     parser.add_argument("--n_distractors", type=int, default=0)
     parser.add_argument("--fresh_data", action="store_true", default=True)
     parser.add_argument("--phase1_checkpoint", default="checkpoints/qwen7b_v2/best.pt")
@@ -293,7 +307,7 @@ def main():
     # Load Phase 1 checkpoint
     print(f"\nLoading Phase 1 checkpoint: {args.phase1_checkpoint}")
     cp = torch.load(args.phase1_checkpoint, map_location=args.device, weights_only=False)
-    sm.memory_block.load_state_dict(cp["memory_block_state"])
+    sm.memory_block.load_state_dict(cp["memory_block_state"], strict=False)
     print(f"  Phase 1: loss={cp['loss']:.4f}, gate={cp['gate']:.4f}")
 
     # Generate data
@@ -318,6 +332,7 @@ def main():
         eval_gate=args.eval_gate,
         test_data=test_data,
         contrastive_weight=args.contrastive_weight,
+        recon_weight=args.recon_weight,
         n_distractors=args.n_distractors,
         fresh_data=args.fresh_data,
     )
