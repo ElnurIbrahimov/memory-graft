@@ -289,18 +289,34 @@ class SurgicalModel:
         print(f"Saved {len(self.memory_blocks)} memory block(s) to {path}")
 
     def load_memory_block(self, path):
-        """Load memory block weights."""
+        """Load memory block weights. Handles three checkpoint formats:
+        1. save_memory_block format: {layer_10: state_dict, layer_14: ...}
+        2. train_joint checkpoint: {memory_block_10: state_dict, epoch: ..., ...}
+        3. Old single-block: {read_query_proj.weight: ..., ...}
+        """
         state = torch.load(path, weights_only=True, map_location=self.device)
 
-        # Handle old single-block checkpoints
-        if all(not k.startswith("layer_") for k in state.keys()):
-            first_idx = self.layer_indices[0]
-            self.memory_blocks[first_idx].load_state_dict(state)
-            print(f"Loaded single memory block from {path} into layer {first_idx}")
+        # Format 1: save_memory_block format (layer_N keys)
+        layer_keys = [k for k in state if k.startswith("layer_")]
+        if layer_keys:
+            for key in layer_keys:
+                idx = int(key.split("_")[1])
+                if idx in self.memory_blocks:
+                    self.memory_blocks[idx].load_state_dict(state[key])
+            print(f"Loaded memory blocks from {path}")
             return
 
-        for key, block_state in state.items():
-            idx = int(key.split("_")[1])
-            if idx in self.memory_blocks:
-                self.memory_blocks[idx].load_state_dict(block_state)
-        print(f"Loaded memory blocks from {path}")
+        # Format 2: train_joint checkpoint (memory_block_N keys)
+        mb_keys = [k for k in state if k.startswith("memory_block_")]
+        if mb_keys:
+            for key in mb_keys:
+                idx = int(key.rsplit("_", 1)[1])
+                if idx in self.memory_blocks:
+                    self.memory_blocks[idx].load_state_dict(state[key])
+            print(f"Loaded memory blocks from {path} (training checkpoint)")
+            return
+
+        # Format 3: old single-block checkpoint (raw state_dict keys)
+        first_idx = self.layer_indices[0]
+        self.memory_blocks[first_idx].load_state_dict(state)
+        print(f"Loaded single memory block from {path} into layer {first_idx}")
