@@ -296,8 +296,8 @@ class SurgicalModel:
         """
         state = torch.load(path, weights_only=True, map_location=self.device)
 
-        # Format 1: save_memory_block format (layer_N keys)
-        layer_keys = [k for k in state if k.startswith("layer_")]
+        # Format 1: save_memory_block format (layer_N keys where N is a number)
+        layer_keys = [k for k in state if k.startswith("layer_") and k.split("_")[1].isdigit()]
         if layer_keys:
             for key in layer_keys:
                 idx = int(key.split("_")[1])
@@ -307,7 +307,7 @@ class SurgicalModel:
             return
 
         # Format 2: train_joint checkpoint (memory_block_N keys)
-        mb_keys = [k for k in state if k.startswith("memory_block_")]
+        mb_keys = [k for k in state if k.startswith("memory_block_") and k.rsplit("_", 1)[1].isdigit()]
         if mb_keys:
             for key in mb_keys:
                 idx = int(key.rsplit("_", 1)[1])
